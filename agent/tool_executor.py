@@ -851,12 +851,19 @@ def _run_sequential_tool_execution_middleware(
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
     authorization_gate = _ConcurrentToolAuthorizationGate()
+    # A single slot still needs the same abandonment fence as a concurrent batch:
+    # a timed-out pre-hook or start callback must not later dispatch the tool.
+    start_gate = _StartOrderGate(0.0)
+    begin_execution = _WorkerStartOnce(start_gate, 0, function_name)
     worker_tid: list[int] = []
 
     def _run() -> _ManagedToolResult:
         with _registered_tool_worker(agent) as tid:
             worker_tid.append(tid)
-            return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+            return _run_agent_tool_execution_middleware(
+                agent, authorization_gate=authorization_gate,
+                begin_execution=begin_execution.advance, **kwargs,
+            )
 
     if ref.trace is None:
         ref.trace = []
@@ -894,6 +901,7 @@ def _run_sequential_tool_execution_middleware(
                 duration_ms=int(timeout_s * 1000), status="timeout", error_type="tool_timeout", error_message=message,
             )
         abandoned = True
+        start_gate.abandon()
         future.cancel()
         if state == "timeout":
             _interrupt_worker_tids(agent, worker_tid)
@@ -1133,13 +1141,19 @@ class _StartOrderGate:
                     "start-order gate timed out for %s (order=%d next=%d); proceeding out of order",
                     tool_name or "tool", order, self._next_order,
                 )
-            try:
-                if callback is not None:
-                    callback()
-            finally:
+        # Start callbacks include UI bridges and filesystem checkpoints. They may
+        # block: holding the condition here prevents BOTH bounded gate waits and
+        # abandon() from acquiring it, defeating the executor's deadline.
+        try:
+            if callback is not None:
+                callback()
+        finally:
+            with self._condition:
                 self._next_order = max(self._next_order, order + 1)
                 self._condition.notify_all()
-        return True
+        # Abandonment may have won while preflight was running. Its resumption
+        # must not authorize a tool whose result the owner has already settled.
+        return not self.abandoned.is_set()
 
 
 class _WorkerStartOnce:
