@@ -280,6 +280,7 @@ class _ToolLifecycle:
 
     def complete(self, callback: Callable[[], None]) -> None:
         with self._lock:
+            # One start/completion pair per call: the first completion owns cleanup.
             if self._completed:
                 return
             self._completed = True
