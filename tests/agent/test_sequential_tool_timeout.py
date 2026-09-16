@@ -16,27 +16,37 @@ from tools.clarify_gateway import resolve_clarify_timeout
 
 
 @pytest.mark.parametrize("mode", ["sequential", "concurrent"])
-@pytest.mark.parametrize("stage", ["pre_hook", "tool_started"])
+@pytest.mark.parametrize("stage", ["pre_hook", "tool_started", "checkpoint", "snapshot", "progress"])
 @pytest.mark.parametrize("stop", ["timeout", "interrupt"])
 def test_abandoned_preflight_cannot_start_a_tool(tmp_path, monkeypatch, mode, stage, stop):
     """Both executors must retire blocked preflight before acknowledging abandonment."""
+    import agent.display as display
     import agent.tool_executor as te
     import model_tools
     import tools.daemon_pool as daemon_pool
     from tools.registry import ToolRegistry
+    from tui_gateway import server
 
     agent = _make_agent(tmp_path)
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     effects = tmp_path / "effects.txt"
     messages, errors, futures = [], [], []
     registry = ToolRegistry()
+    events = []
+    session = {"tool_progress_mode": "all", "tool_started_at": {}, "edit_snapshots": {}}
+    sid = "abandoned-preflight"
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_emit", lambda event, _sid, payload=None: events.append((event, payload)))
+    callbacks = server._agent_cbs(sid)
+    for name in ("tool_start_callback", "tool_complete_callback", "tool_progress_callback"):
+        setattr(agent, name, callbacks[name])
 
     def write_effect(args, **kwargs):
         with effects.open("a", encoding="utf-8") as output:
-            output.write(args["value"] + "\n")
+            output.write(args["content"] + "\n")
         return json.dumps({"ok": True})
 
-    registry.register(name="web_extract", toolset="web", schema={}, handler=write_effect)
+    registry.register(name="write_file", toolset="file", schema={}, handler=write_effect)
     monkeypatch.setattr(model_tools, "registry", registry)
     monkeypatch.setattr(te, "_resolve_concurrent_tool_timeout", lambda: 2.0 if stop == "timeout" else None)
     monkeypatch.setattr(te, "_resolve_sequential_tool_timeout", lambda: 2.0 if stop == "timeout" else None)
@@ -62,15 +72,34 @@ def test_abandoned_preflight_cannot_start_a_tool(tmp_path, monkeypatch, mode, st
                 block_preflight()
             return None, args
         monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_hook)
-    else:
+    elif stage == "tool_started":
         def on_start(call_id, *args):
+            callbacks["tool_start_callback"](call_id, *args)
             if call_id == "abandoned":
                 block_preflight()
         agent.tool_start_callback = on_start
+    elif stage == "checkpoint":
+        agent._checkpoint_mgr.enabled = True
+        monkeypatch.setattr(agent._checkpoint_mgr, "ensure_checkpoint", lambda *args: block_preflight())
+    elif stage == "snapshot":
+        capture_snapshot = display.capture_local_edit_snapshot
+
+        def snapshot(name, args):
+            if args["content"] == "late side effect":
+                block_preflight()
+            return capture_snapshot(name, args)
+        monkeypatch.setattr(display, "capture_local_edit_snapshot", snapshot)
+    else:
+        def on_progress(event, name=None, preview=None, args=None, **kwargs):
+            if event == "tool.started" and args["content"] == "late side effect":
+                block_preflight()
+            callbacks["tool_progress_callback"](event, name, preview, args, **kwargs)
+        agent.tool_progress_callback = on_progress
 
     execute = getattr(agent, "_execute_tool_calls_" + mode)
     call = _tool_call("abandoned")
-    call.function.arguments = json.dumps({"value": "late side effect"})
+    call.function.name = "write_file"
+    call.function.arguments = json.dumps({"path": str(effects), "content": "late side effect"})
 
     def run():
         try:
@@ -89,6 +118,9 @@ def test_abandoned_preflight_cannot_start_a_tool(tmp_path, monkeypatch, mode, st
         # Covers the concurrent poll (5s) + interrupt grace (3s), without relying
         # on a sleep to position the race. Preflight stays blocked until teardown.
         bounded = returned.wait(12)
+        if bounded and stage == "checkpoint":
+            # Start has returned: cleanup must not wait for checkpoint I/O.
+            assert not session["tool_started_at"] and not session["edit_snapshots"]
     finally:
         release.set()
         owner.join(10)
@@ -101,12 +133,25 @@ def test_abandoned_preflight_cannot_start_a_tool(tmp_path, monkeypatch, mode, st
     assert not effects.exists(), "an abandoned call dispatched after preflight resumed"
     assert [message["tool_call_id"] for message in messages] == ["abandoned"]
     assert ("timed out" if stop == "timeout" else "cancelled") in messages[0]["content"]
+    lifecycle = [
+        (event, payload["tool_id"]) for event, payload in events
+        if event in {"tool.start", "tool.complete"}
+    ]
+    expected = [] if stage in {"pre_hook", "progress"} else [("tool.start", "abandoned")]
+    assert lifecycle == expected + [("tool.complete", "abandoned")]
+    assert session["tool_started_at"] == {}
+    assert session["edit_snapshots"] == {}
 
     # The same real dispatcher must still execute the next accepted call.
     followup = _tool_call("next")
-    followup.function.arguments = json.dumps({"value": "accepted"})
+    followup.function.name = "write_file"
+    followup.function.arguments = json.dumps({"path": str(effects), "content": "accepted"})
     execute(SimpleNamespace(tool_calls=[followup]), [], "task")
     assert effects.read_text(encoding="utf-8") == "accepted\n"
+    assert [(event, payload["tool_id"]) for event, payload in events[-2:]] == [
+        ("tool.start", "next"), ("tool.complete", "next"),
+    ]
+    assert not session["tool_started_at"] and not session["edit_snapshots"]
 
 
 @pytest.fixture(autouse=True)
